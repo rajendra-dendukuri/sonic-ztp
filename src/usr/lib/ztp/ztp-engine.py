@@ -26,10 +26,12 @@ import argparse
 import re
 import json
 import traceback
+from random import seed, shuffle
 from natsort import natsorted
 from urllib.parse import urlparse
 from ztp.ZTPSections import ZTPJson
 import ztp.ZTPCfg
+from ztp.DecodeSysEeprom import sysEeprom
 from ztp.Downloader import Downloader
 from ztp.Logger import logger
 from ztp.ZTPLib import getTimestamp, runCommand, runcmd_pids 
@@ -109,6 +111,15 @@ class ZTPEngine():
         ## Interfaces state table
         self.__intf_state = dict()
 
+        ## List of supported FEC modes
+        self.__fec_modes = None
+
+        ## Timestamp when port fec mode was modified
+        self.__fec_mode_change_time = None
+
+        ## FEC mode index set for the ports which are currently inactive
+        self.__oper_fec_mode = 0
+
         ## Redis DB connectors
         self.configDB = None
         self.applDB   = None
@@ -182,6 +193,168 @@ class ZTPEngine():
 
         return link_up_detected
 
+    def __get_fec_settings(self):
+        '''!
+        Retrieves the port fec configuration from the Config DB
+        '''
+
+        fec_mode_cfg = dict()
+        port_tbl = self.configDB.get_table('PORT')
+        if not port_tbl:
+            return fec_mode_cfg
+
+        for intf in port_tbl.keys():
+            if intf.startswith('Ethernet') is False:
+                continue
+            try:
+                fec_mode = port_tbl.get(intf).get('fec')
+            except Exception as e:
+                fec_mode = None
+            if fec_mode is None:
+                fec_mode = "none"
+            fec_mode_cfg[intf] = fec_mode
+        return fec_mode_cfg
+
+    def __isSupportedFECMode(self, port, lanes, speed, fec_mode):
+        '''!
+         Check if a specific fec mode is supported on a specified switch port
+
+         @param port (str) Switch port whose fec mode support is being tested
+
+         @param lanes (int) Number of lanes the port is operating with
+
+         @param speed (str) The speed at which the port is operating
+
+         @param fec_mode (str) Specifies the fec mode to be tested for support
+
+         @return  False - If the port does not support the specified fec_mode
+                  True  - If the port supports the specified fec_mode
+        '''
+        return True
+
+    def __apply_fec_mode(self, fec_cfg=None, fec_mode=None, force=False):
+        '''!
+         Applies the specified FEC configuration for switch ports
+
+         @param fec_cfg (dict) If specified, it indicates the list of ports and
+                               the fec mode that needs to be set to them
+
+         @param fec_mode (str) Specifies the fec mode that needs to be set to all
+                               the switch ports
+
+         @param force (bool) If True, the fec mode is applied to the port even if the
+                             switch port is not in a link down state
+        '''
+
+        if fec_cfg:
+            # Set fec mode only for specified ports
+            intf_list = fec_cfg.keys()
+        else:
+            # Set fec mode for all known switch ports
+            intf_list = self.__intf_state.keys()
+        for intf in natsorted(intf_list):
+            if intf[0:3] != 'eth' and \
+               (force == True or self.__intf_state[intf]['operstate'] == 'down'):
+                try:
+                    if fec_mode is None:
+                        _fec_mode = fec_cfg[intf]
+                    else:
+                        _fec_mode = fec_mode
+                    port_entry = self.configDB.get_entry('PORT', intf)
+                    if port_entry != {}:
+                        if not self.__isSupportedFECMode(intf, len(port_entry["lanes"].split(",")),
+                                                         port_entry["speed"],  _fec_mode):
+                            continue
+                        self.configDB.mod_entry('PORT', intf, {"fec": _fec_mode})
+                except:
+                    # Failed to set the value in ConfigDB, trying command to set the fec mode
+                    rv = runCommand('config interface fec %s %s' % (intf, _fec_mode), capture_stdout=False)
+                    if rv != 0:
+                        logger.warning("Failed to set interface %s FEC mode to %s" % (intf, _fec_mode))
+
+    def __change_fec_mode(self):
+        '''!
+        Modify Forward Error Correction (fec) mode of ports to detect a link up
+        '''
+        if self.__fec_modes is None:
+            self.__fec_modes = list(getCfg('fec-modes'))
+        else:
+           self.__oper_fec_mode += 1
+
+        if self.__oper_fec_mode >= len(self.__fec_modes):
+           self.__oper_fec_mode = 0
+           shuffle(self.__fec_modes)
+
+        new_fec_mode = self.__fec_modes[self.__oper_fec_mode]
+        logger.debug("Configuring interfaces FEC mode to %s." % (new_fec_mode))
+        self.__apply_fec_mode(fec_mode=new_fec_mode)
+
+    def __save_ztp_port_config(self):
+        '''!
+        Save ZTP port configuration currently in use to detect a port link up
+        '''
+        ztp_inband_port_cfg = dict()
+        if getCfg('feat-fec-auto-tuning'):
+            ztp_inband_port_cfg["fec-mode"] = self.__get_fec_settings()
+        with open(getCfg('ztp-port-json'), "w") as json_file:
+            json.dump(ztp_inband_port_cfg, json_file, indent=4)
+
+    def __load_ztp_port_config(self):
+        '''!
+        Restores ZTP port configuration if the ZTP configuration profile is active
+        '''
+        # ZTP port configuration is required only for inband interfaces and also when
+        # automatic port configuration feature is enabled
+        if getCfg('feat-inband') is False or \
+               (getCfg('feat-fec-auto-tuning') is False):
+            return
+
+        # Detect if ztp configuration profile is active
+        if self.__is_ztp_profile_active() is False:
+            return
+
+        # Retore ztp inband port configuration
+        if os.path.isfile(getCfg('ztp-port-json')):
+            try:
+                with open(getCfg('ztp-port-json')) as json_file:
+                    ztp_inband_port_cfg = json.load(json_file)
+                _fec_cfg = ztp_inband_port_cfg.get("fec-mode")
+            except Exception as e:
+                logger.error("Exception [%s]: Failed to read ZTP inband port configuration file %s." % (e, getCfg('ztp-port-json')))
+                return
+
+            if getCfg('feat-fec-auto-tuning') and  \
+               _fec_cfg is not None:
+                self.__apply_fec_mode(fec_cfg=_fec_cfg, force=True)
+
+            # Restart networking after applying ztp inband port configuration
+            self.__restart_networking()
+
+    def __change_port_config(self):
+        '''!
+        Periodically modifies port configuration to detect a link up
+           - Changes FEC mode of a port every discovery interval
+           - Changes port breakout mode every port breakout interval
+        '''
+        if getCfg('feat-inband') is False:
+            return
+
+        if getCfg('feat-fec-auto-tuning'):
+            # Toggle fec mode of in-band interfaces till a link up is detected
+            if self.__fec_mode_change_time is None or \
+               time.time() - self.__fec_mode_change_time > getCfg('discovery-interval'):
+                self.__change_fec_mode()
+                self.__save_ztp_port_config()
+                self.__fec_mode_change_time = time.time()
+
+    def __restart_networking(self):
+        '''!
+        Restarts networking service
+        '''
+        logger.info('Restarting network discovery after link scan.')
+        runCommand('systemctl restart interfaces-config', capture_stdout=False)
+        logger.info('Restarted network discovery after link scan.')
+
     def __is_ztp_profile_active(self):
         '''!
         Checks if the ZTP configuration profile is loaded as the switch running
@@ -226,9 +399,15 @@ class ZTPEngine():
 
         # Populate data of all ztp eligible interfaces
         link_scan_result = self.__detect_intf_state()
+        if link_scan_result is False:
+            # Modify port configuration of in-band ports till a link up is detected
+            self.__change_port_config()
         return link_scan_result
 
     def __cleanup_dhcp_leases(self):
+        '''!
+        Removes all existing DHCP lease files
+        '''
 
         # Use ZTP interface used to obtain provisioning information
         runCommand('rm -f /var/lib/dhcp/dhclient*.eth0.leases', capture_stdout=False)
@@ -296,6 +475,12 @@ class ZTPEngine():
             # ZTP is resuming previous session, use configuration already loaded during
             # config-setup
             rc = runCommand(cmd, capture_stdout=False)
+            if event == 'resume':
+                # Load saved in-band temporary ztp port configuration
+                try:
+                    self.__load_ztp_port_config()
+                except Exception as e:
+                    logger.error('Exception [%s]: Failed to load ZTP inband port configuration.' % (e))
             self.__ztp_profile_loaded = True
             return True
         return False
@@ -520,11 +705,11 @@ class ZTPEngine():
                     finalResult = 'FAILED'
 
                 # Update this configuration section's result in ztp json file
-                logger.info('Processed Configuration section %s with result %s, exit code (%d) at %s.' % (sec, finalResult, rc, section['timestamp']))
                 if finalResult == 'FAILED' and section.get('error') is None:
                     section['error'] = 'Plugin failed'
                 section['exit-code'] = rc
                 self.objztpJson.updateStatus(section, finalResult)
+                logger.info('Processed Configuration section %s with result %s, exit code (%d) at %s.' % (sec, finalResult, rc, section['timestamp']))
 
                 # Check if abort ZTP on failure flag is set
                 if getField(section, 'halt-on-failure', bool, False) is True and finalResult == 'FAILED':
@@ -811,6 +996,13 @@ class ZTPEngine():
         else:
             logger.info('ZTP service started.')
 
+        # Initialize the random number generator with system mac address as the seed value
+        try:
+            seed(int(sysEeprom.get_mac_addr().replace(':',''), 16))
+        except:
+            logger.info('Failed to set system MAC address as the random number generator seed input.')
+            pass
+
         self.__ztp_engine_start_time = getTimestamp()
         _start_time = None
         self.ztp_mode = 'DISCOVERY'
@@ -849,9 +1041,7 @@ class ZTPEngine():
             # Scan for inband interfaces to link up and restart interface connectivity
             if self.__link_scan():
                 updateActivity('Restarting network discovery after link scan')
-                logger.info('Restarting network discovery after link scan.')
-                runCommand('systemctl restart interfaces-config', capture_stdout=False)
-                logger.info('Restarted network discovery after link scan.')
+                self.__restart_networking()
                 _start_time = time.time()
                 continue
 
@@ -865,9 +1055,7 @@ class ZTPEngine():
                 if self.test_mode is False:
                     # Remove existing leases to source new provisioning data
                     self.__cleanup_dhcp_leases()
-                    logger.info('Restarting network discovery.')
-                    runCommand('systemctl restart interfaces-config', capture_stdout=False)
-                    logger.info('Restarted network discovery.')
+                    self.__restart_networking()
                 _start_time = time.time()
                 continue
 

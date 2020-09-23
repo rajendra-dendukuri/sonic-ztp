@@ -166,6 +166,8 @@ def ztp_erase(yesFlag):
         os.remove(getCfg('ztp-json', ztp_cfg=ztp_cfg))
     if os.path.isfile(getCfg('ztp-json-shadow', ztp_cfg=ztp_cfg)):
         os.remove(getCfg('ztp-json-shadow', ztp_cfg=ztp_cfg))
+    if os.path.isfile(getCfg('ztp-port-json', ztp_cfg=ztp_cfg)):
+        os.remove(getCfg('ztp-port-json', ztp_cfg=ztp_cfg))
 
 ## Administratively disable ZTP.
 #  It also stops ztp service if it found active, before modifying the configuration.

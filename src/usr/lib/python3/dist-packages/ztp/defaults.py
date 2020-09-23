@@ -25,9 +25,11 @@ defaultCfg = dict( \
   "discovery-interval"   : 10, \
   "config-fallback"      : False, \
   "feat-console-logging" : True, \
+  "feat-fec-auto-tuning" : True, \
   "feat-inband" : True, \
   "feat-ipv4" : True, \
   "feat-ipv6" : True, \
+  "fec-modes"            : ["none", "fc", "rs"], \
   "graph-url"            : "/var/run/ztp/dhcp_graph_url", \
   "halt-on-failure"      : False, \
   "https-secure"         : True, \
@@ -42,6 +44,7 @@ defaultCfg = dict( \
   "plugins-dir"          : "/usr/lib/ztp/plugins", \
   "provisioning-script"  : "/host/ztp/provisioning-script", \
   "info-feat-console-logging" : "Display ZTP logs over serial console", \
+  "info-feat-fec-auto-tuning" : "Tune port FEC mode to detect a link up", \
   "info-feat-inband" : "ZTP over In-Band interfaces", \
   "info-feat-ipv4" : "ZTP using IPv4 DHCP discovery", \
   "info-feat-ipv6" : "ZTP using IPv6 DHCPv6 discovery", \
@@ -68,6 +71,7 @@ defaultCfg = dict( \
   "ztp-json-opt67"       : "/var/run/ztp/ztp_data_opt67.json", \
   "ztp-json-version" : "1.0", \
   "ztp-lib-dir"          : "/usr/lib/ztp", \
+  "ztp-port-json"        : "/host/ztp/ztp_port_cfg.json", \
   "ztp-restart-flag"     : "/tmp/pending_ztp_restart", \
   "ztp-run-dir"          : "/var/run/ztp", \
   "ztp-tmp-persistent"   : "/var/lib/ztp/sections", \
